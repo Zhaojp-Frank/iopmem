@@ -29,27 +29,43 @@
 #include <linux/pci.h>
 #include <linux/pfn_t.h>
 #include <linux/memremap.h>
+#include <linux/cdev.h>
 
 #define SECTOR_SHIFT		9
 #define PAGE_SECTORS_SHIFT	(PAGE_SHIFT - SECTOR_SHIFT)
 #define PAGE_SECTORS		(1 << PAGE_SECTORS_SHIFT)
 
-static int vendor_id = 0x11f8;
-static int device_id = 0xf117;
-static int bar_id    = 4;
+static int bar_id = 4;
+static int iopmem_major;
 
-module_param(vendor_id, int, S_IRUGO );
-MODULE_PARM_DESC(vendor_id, "The PCIe vendor ID to bind this driver too.");
-module_param(device_id, int, S_IRUGO );
-MODULE_PARM_DESC(device_id, "The PCIe device ID to bind this driver too.");
-module_param(bar_id, int, S_IRUGO );
+static struct class *iopmemc_class;
+static dev_t char_device_num;
+static int max_devices = 16;
+
+#define VENDOR_ID 0x11f8
+#define DEVICE_ID 0xf117
+
+static struct pci_device_id iopmem_id_table[] = {
+	{ PCI_DEVICE(VENDOR_ID, DEVICE_ID) },
+	{ 0, }
+};
+MODULE_DEVICE_TABLE(pci, iopmem_id_table);
+
+module_param(bar_id, int, S_IRUGO);
 MODULE_PARM_DESC(bar_id, "The Base Address Register to use to the iopmem binding.");
 
+module_param(max_devices, int, S_IRUGO);
+MODULE_PARM_DESC(max_devices, "Maximum number of char devices");
+
 struct iopmem_device {
-	struct request_queue	*queue;
-	struct gendisk		*disk;
-	struct list_head        list;
-	struct pci_dev          *pdev;
+	struct request_queue *queue;
+	struct gendisk *disk;
+	struct device *dev;
+
+	int instance;
+
+	int cdev_num;
+	struct cdev cdev;
 
 	/* One contiguous memory region per device */
 	phys_addr_t		phys_addr;
@@ -89,7 +105,7 @@ static pfn_t iopmem_lookup_pfn(struct iopmem_device *iopmem, sector_t sector)
 	return phys_to_pfn_t(iopmem->phys_addr + offset, PFN_DEV | PFN_MAP);
 }
 
-/* we can only access the mtr device with full 32-bit word accesses which cannot
+/* we can only access the iopmem device with full 32-bit word accesses which cannot
  * be gaurantee'd by the regular memcpy */
 static void memcpy_from_iopmem(void *dst, const void *src, size_t sz)
 {
@@ -171,10 +187,6 @@ static void iopmem_do_bvec(struct iopmem_device *iopmem, struct page *page,
 		copy_from_iopmem(mem + off, iopmem, sector, len);
 		flush_dcache_page(page);
 	} else {
-		/*
-		 * FIXME: Need more involved flushing to ensure that writes to
-		 * NVDIMMs are actually durable before returning.
-		 */
 		flush_dcache_page(page);
 		copy_to_iopmem(iopmem, mem + off, sector, len);
 	}
@@ -249,18 +261,151 @@ static const struct block_device_operations iopmem_fops = {
 	.getgeo =		iopmem_getgeo,
 };
 
-/* Kernel module stuff */
-static LIST_HEAD(iopmem_devices);
-static int iopmem_major;
+static int iopmemc_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+{
+	struct iopmem_device *iopmem = vma->vm_private_data;
+	unsigned long physaddr;
+	int error;
+	unsigned long vaddr = (unsigned long) vmf->virtual_address;
+	pfn_t pfn;
 
-static struct iopmem_device *iopmem_alloc(struct pci_dev *pdev, int i)
+	physaddr = (vaddr - vma->vm_start +
+		    (vma->vm_pgoff << PAGE_SHIFT) + iopmem->phys_addr);
+	pfn = phys_to_pfn_t(physaddr, PFN_DEV | PFN_MAP);
+
+	if (!pfn_t_valid(pfn))
+		return VM_FAULT_SIGBUS;
+
+	if ((error = vm_insert_mixed(vma, vaddr, pfn))) {
+		dev_err(iopmem->dev,
+			"Unable to insert mixed page into mapping :%d\n",
+			error);
+
+		return VM_FAULT_SIGBUS;
+	}
+
+	return VM_FAULT_NOPAGE;
+}
+
+const struct vm_operations_struct vmops = {
+	.fault = iopmemc_fault,
+};
+
+static int iopmemc_open(struct inode *inode, struct file *filp)
 {
 	struct iopmem_device *iopmem;
+
+	iopmem = container_of(inode->i_cdev, struct iopmem_device, cdev);
+	filp->private_data = iopmem;
+
+	inode->i_size = iopmem->size;
+
+	return 0;
+}
+
+static int iopmemc_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+	struct iopmem_device *iopmem = filp->private_data;
+
+	phys_addr_t end = ((vma->vm_pgoff << PAGE_SHIFT) +
+			   vma->vm_end - vma->vm_start);
+
+	if (end > (iopmem->phys_addr + 1))
+		return -EINVAL;
+
+	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+	vma->vm_private_data = iopmem;
+	vma->vm_ops = &vmops;
+	vma->vm_flags |= VM_MIXEDMAP;
+
+	return 0;
+}
+
+static const struct file_operations iopmemc_fops = {
+	.owner = THIS_MODULE,
+	.open = iopmemc_open,
+	.mmap = iopmemc_mmap,
+};
+
+static DEFINE_IDA(iopmem_instance_ida);
+static DEFINE_SPINLOCK(ida_lock);
+
+static int iopmem_set_instance(struct iopmem_device *iopmem)
+{
+	int instance, error;
+
+	do {
+		if (!ida_pre_get(&iopmem_instance_ida, GFP_KERNEL))
+			return -ENODEV;
+
+		spin_lock(&ida_lock);
+		error = ida_get_new(&iopmem_instance_ida, &instance);
+		spin_unlock(&ida_lock);
+
+	} while (error == -EAGAIN);
+
+	if (error)
+		return -ENODEV;
+
+	iopmem->instance = instance;
+	return 0;
+}
+
+static void iopmem_release_instance(struct iopmem_device *iopmem)
+{
+	spin_lock(&ida_lock);
+	ida_remove(&iopmem_instance_ida, iopmem->instance);
+	spin_unlock(&ida_lock);
+}
+
+static int iopmem_attach_disk(struct iopmem_device *iopmem)
+{
 	struct gendisk *disk;
+	int nid = dev_to_node(iopmem->dev);
+
+	blk_queue_make_request(iopmem->queue, iopmem_make_request);
+	blk_queue_physical_block_size(iopmem->queue, PAGE_SIZE);
+	blk_queue_max_hw_sectors(iopmem->queue, UINT_MAX);
+	blk_queue_bounce_limit(iopmem->queue, BLK_BOUNCE_ANY);
+	queue_flag_set_unlocked(QUEUE_FLAG_NONROT, iopmem->queue);
+
+	disk = alloc_disk_node(0, nid);
+	if (unlikely(!disk))
+		return -ENOMEM;
+
+	disk->major		= iopmem_major;
+	disk->first_minor	= 0;
+	disk->fops		= &iopmem_fops;
+	disk->private_data	= iopmem;
+	disk->driverfs_dev      = iopmem->dev;
+	disk->queue		= iopmem->queue;
+	disk->flags		= GENHD_FL_EXT_DEVT;
+	sprintf(disk->disk_name, "iopmem%d", iopmem->instance);
+	set_capacity(disk, iopmem->size >> SECTOR_SHIFT);
+	iopmem->disk = disk;
+
+	add_disk(disk);
+	revalidate_disk(disk);
+
+	return 0;
+}
+
+static void iopmem_detach_disk(struct iopmem_device *iopmem)
+{
+	del_gendisk(iopmem->disk);
+	put_disk(iopmem->disk);
+}
+
+static int iopmem_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+{
+	struct iopmem_device *iopmem;
+	struct device *dev;
+	struct device *char_sys_dev;
 	int err = 0;
+	int nid = dev_to_node(&pdev->dev);
 
 	if (pci_enable_device_mem(pdev) < 0) {
-		pr_err("iopmem: unable to enable device!\n");
+		dev_err(&pdev->dev, "unable to enable device!\n");
 		goto out;
 	}
 
@@ -270,88 +415,104 @@ static struct iopmem_device *iopmem_alloc(struct pci_dev *pdev, int i)
 		goto out_disable_device;
 	}
 
-
 	iopmem->phys_addr = pci_resource_start(pdev, bar_id);
 	iopmem->size = pci_resource_end(pdev, bar_id) - iopmem->phys_addr + 1;
-	iopmem->pdev = pdev;
+	iopmem->dev = dev = get_device(&pdev->dev);
+	pci_set_drvdata(pdev, iopmem);
 
-	pr_info("iopmem%d: bar space 0x%llx len %lld\n", i+1,
+	if ((err = iopmem_set_instance(iopmem)))
+		goto out_put_device;
+
+	dev_info(dev, "bar space 0x%llx len %lld\n",
 		(unsigned long long) iopmem->phys_addr,
 		(unsigned long long) iopmem->size);
 
-
-	// Should probably call devm_request_mem_region, but nvme driver
-	//  has already reserved it.
-
-	iopmem->queue = blk_alloc_queue(GFP_KERNEL);
-	if (unlikely(!iopmem->queue)) {
-		err = -ENOMEM;
-		goto out_free_dev;
+	if (!devm_request_mem_region(dev, iopmem->phys_addr,
+				     iopmem->size, dev_name(dev))) {
+		dev_warn(dev, "could not reserve region [0x%pa:0x%zx]\n",
+			 &iopmem->phys_addr, iopmem->size);
+		err = -EBUSY;
+		goto out_release_instance;
 	}
 
-	iopmem->virt_addr = devm_memremap_pages(&pdev->dev, &pdev->resource[bar_id],
-					      &iopmem->queue->q_usage_counter, NULL,
-					      MEMREMAP_WC);
+	iopmem->queue = blk_alloc_queue_node(GFP_KERNEL, nid);
+	if (!iopmem->queue) {
+		err = -ENOMEM;
+		goto out_release_instance;
+	}
 
+	iopmem->virt_addr = devm_memremap_pages(dev, &pdev->resource[bar_id],
+				&iopmem->queue->q_usage_counter,
+				NULL, MEMREMAP_WC);
 	if (IS_ERR(iopmem->virt_addr)) {
 		err = -ENXIO;
 		goto out_free_queue;
 	}
 
-	blk_queue_make_request(iopmem->queue, iopmem_make_request);
-	blk_queue_max_hw_sectors(iopmem->queue, 1024);
-	blk_queue_bounce_limit(iopmem->queue, BLK_BOUNCE_ANY);
-
-	disk = alloc_disk(0);
-	if (unlikely(!disk)) {
-		err = -ENOMEM;
+	cdev_init(&iopmem->cdev, &iopmemc_fops);
+	iopmem->cdev_num = MKDEV(MAJOR(char_device_num), iopmem->instance);
+	if ((err = cdev_add(&iopmem->cdev, iopmem->cdev_num, 1))) {
+		dev_err(dev, "failed to create char device!\n");
 		goto out_free_queue;
 	}
 
-	disk->major		= iopmem_major;
-	disk->first_minor	= 0;
-	disk->fops		= &iopmem_fops;
-	disk->private_data	= iopmem;
-	disk->driverfs_dev      = &pdev->dev;
-	disk->queue		= iopmem->queue;
-	disk->flags		= GENHD_FL_EXT_DEVT;
-	sprintf(disk->disk_name, "iopmem%d", i+1);
-	set_capacity(disk, iopmem->size >> SECTOR_SHIFT);
-	iopmem->disk = disk;
+        char_sys_dev = device_create(iopmemc_class, dev,
+				     iopmem->cdev_num,
+				     iopmem, "iopmemc%d",
+				     iopmem->instance);
+	if (IS_ERR(char_sys_dev)) {
+		err = -EFAULT;
+		dev_err(dev, "failed to create iopmemc device!\n");
+		goto out_free_chdev;
+	}
 
-	return iopmem;
+	if ((err = iopmem_attach_disk(iopmem)))
+		goto out_free_chsysdev;
 
+	return 0;
+
+out_free_chsysdev:
+	device_destroy(iopmemc_class, iopmem->cdev_num);
+out_free_chdev:
+	cdev_del(&iopmem->cdev);
 out_free_queue:
 	blk_cleanup_queue(iopmem->queue);
-out_free_dev:
+out_release_instance:
+	iopmem_release_instance(iopmem);
+out_put_device:
+	put_device(&pdev->dev);
 	kfree(iopmem);
 out_disable_device:
 	pci_disable_device(pdev);
 out:
-	return ERR_PTR(err);
+	return err;
 }
 
-static void iopmem_free(struct iopmem_device *iopmem)
+static void iopmem_remove(struct pci_dev *pdev)
 {
-	put_disk(iopmem->disk);
+	struct iopmem_device *iopmem = pci_get_drvdata(pdev);
+
+	blk_set_queue_dying(iopmem->queue);
+	iopmem_detach_disk(iopmem);
 	blk_cleanup_queue(iopmem->queue);
+	device_destroy(iopmemc_class, iopmem->cdev_num);
+	cdev_del(&iopmem->cdev);
+	iopmem_release_instance(iopmem);
+	put_device(iopmem->dev);
 	kfree(iopmem);
-	pci_disable_device(iopmem->pdev);
+	pci_disable_device(pdev);
 }
 
-static void iopmem_del_one(struct iopmem_device *iopmem)
-{
-	list_del(&iopmem->list);
-	del_gendisk(iopmem->disk);
-	iopmem_free(iopmem);
-}
+static struct pci_driver iopmem_pci_driver = {
+	.name = "iopmem",
+	.id_table = iopmem_id_table,
+	.probe = iopmem_probe,
+	.remove = iopmem_remove,
+};
 
 static int __init iopmem_init(void)
 {
 	int result;
-	struct iopmem_device *iopmem, *next;
-	int ndevs = 0;
-	struct pci_dev *pdev = NULL;
 
 	result = register_blkdev(0, "iopmem");
 	if (result < 0)
@@ -359,32 +520,30 @@ static int __init iopmem_init(void)
 	else
 		iopmem_major = result;
 
-	while ((pdev = pci_get_device(vendor_id, device_id, pdev))) {
-		iopmem = iopmem_alloc(pdev, ndevs);
-		if (IS_ERR(iopmem)) {
-			result = PTR_ERR(iopmem);
-			goto out_free;
-		}
-		list_add_tail(&iopmem->list, &iopmem_devices);
-		ndevs++;
+	iopmemc_class = class_create(THIS_MODULE, "iopmemc");
+	if (IS_ERR(iopmemc_class)) {
+		result = PTR_ERR(iopmemc_class);
+		goto out_unreg_block;
 	}
 
-	if (ndevs == 0) {
-		result = -ENODEV;
-		goto out_free;
-	}
+	if ((result = alloc_chrdev_region(&char_device_num, 0,
+					  max_devices, "iopmemc")))
+		goto out_destroy_class;
 
-	list_for_each_entry(iopmem, &iopmem_devices, list)
-		add_disk(iopmem->disk);
+	result = pci_register_driver(&iopmem_pci_driver);
+	if (result)
+		goto out_unreg_chrdev;
 
 	pr_info("iopmem: module loaded\n");
 	return 0;
 
-out_free:
-	list_for_each_entry_safe(iopmem, next, &iopmem_devices, list) {
-		list_del(&iopmem->list);
-		iopmem_free(iopmem);
-	}
+out_unreg_chrdev:
+	unregister_chrdev_region(char_device_num, max_devices);
+
+out_destroy_class:
+	class_destroy(iopmemc_class);
+
+out_unreg_block:
 	unregister_blkdev(iopmem_major, "iopmem");
 
 	return result;
@@ -392,11 +551,9 @@ out_free:
 
 static void __exit iopmem_exit(void)
 {
-	struct iopmem_device *iopmem, *next;
-
-	list_for_each_entry_safe(iopmem, next, &iopmem_devices, list)
-		iopmem_del_one(iopmem);
-
+	pci_unregister_driver(&iopmem_pci_driver);
+	class_destroy(iopmemc_class);
+	unregister_chrdev_region(char_device_num, max_devices);
 	unregister_blkdev(iopmem_major, "iopmem");
 	pr_info("iopmem: module unloaded\n");
 }

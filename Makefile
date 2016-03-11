@@ -1,7 +1,21 @@
-KDIR ?= /lib/modules/`uname -r`/build
+#
+# By default, the build is done against the running linux kernel source.
+# To build against a different kernel source tree, set SYSSRC:
+#
+#    make KDIR=/path/to/kernel/source
 
-default:
-	$(MAKE) -C $(KDIR) M=$$PWD
+ifdef KDIR
+ KERNEL_SOURCES	 = $(KDIR)
+else
+ KERNEL_UNAME	:= $(shell uname -r)
+ KERNEL_SOURCES	 = /lib/modules/$(KERNEL_UNAME)/build
+endif
 
-clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) clean
+default: modules
+.PHONY: default
+install: modules_install
+
+.PHONY: install
+
+%::
+	$(MAKE) -C $(KERNEL_SOURCES) M=$$PWD $@
