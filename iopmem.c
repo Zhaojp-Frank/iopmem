@@ -29,15 +29,10 @@
 #include <linux/pci.h>
 #include <linux/pfn_t.h>
 #include <linux/memremap.h>
-#include <linux/cdev.h>
 
 #define SECTOR_SHIFT		9
 #define PAGE_SECTORS_SHIFT	(PAGE_SHIFT - SECTOR_SHIFT)
 #define PAGE_SECTORS		(1 << PAGE_SECTORS_SHIFT)
-
-static struct class *iopmemc_class;
-static dev_t char_device_num;
-static int max_devices = 16;
 
 static const int BAR_ID = 4;
 
@@ -47,18 +42,12 @@ static struct pci_device_id iopmem_id_table[] = {
 };
 MODULE_DEVICE_TABLE(pci, iopmem_id_table);
 
-module_param(max_devices, int, S_IRUGO);
-MODULE_PARM_DESC(max_devices, "Maximum number of char devices");
-
 struct iopmem_device {
 	struct request_queue *queue;
 	struct gendisk *disk;
 	struct device *dev;
 
 	int instance;
-
-	int cdev_num;
-	struct cdev cdev;
 
 	/* One contiguous memory region per device */
 	phys_addr_t		phys_addr;
@@ -234,72 +223,6 @@ static const struct block_device_operations iopmem_fops = {
 	.getgeo =		iopmem_getgeo,
 };
 
-static int iopmemc_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
-{
-	struct iopmem_device *iopmem = vma->vm_private_data;
-	unsigned long physaddr;
-	int error;
-	unsigned long vaddr = (unsigned long) vmf->virtual_address;
-	pfn_t pfn;
-
-	physaddr = (vaddr - vma->vm_start +
-		    (vma->vm_pgoff << PAGE_SHIFT) + iopmem->phys_addr);
-	pfn = phys_to_pfn_t(physaddr, PFN_DEV | PFN_MAP);
-
-	if (!pfn_t_valid(pfn))
-		return VM_FAULT_SIGBUS;
-
-	if ((error = vm_insert_mixed(vma, vaddr, pfn))) {
-		dev_err(iopmem->dev,
-			"Unable to insert mixed page into mapping :%d\n",
-			error);
-
-		return VM_FAULT_SIGBUS;
-	}
-
-	return VM_FAULT_NOPAGE;
-}
-
-const struct vm_operations_struct vmops = {
-	.fault = iopmemc_fault,
-};
-
-static int iopmemc_open(struct inode *inode, struct file *filp)
-{
-	struct iopmem_device *iopmem;
-
-	iopmem = container_of(inode->i_cdev, struct iopmem_device, cdev);
-	filp->private_data = iopmem;
-
-	inode->i_size = iopmem->size;
-
-	return 0;
-}
-
-static int iopmemc_mmap(struct file *filp, struct vm_area_struct *vma)
-{
-	struct iopmem_device *iopmem = filp->private_data;
-
-	phys_addr_t end = ((vma->vm_pgoff << PAGE_SHIFT) +
-			   vma->vm_end - vma->vm_start);
-
-	if (end > (iopmem->phys_addr + 1))
-		return -EINVAL;
-
-	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
-	vma->vm_private_data = iopmem;
-	vma->vm_ops = &vmops;
-	vma->vm_flags |= VM_MIXEDMAP;
-
-	return 0;
-}
-
-static const struct file_operations iopmemc_fops = {
-	.owner = THIS_MODULE,
-	.open = iopmemc_open,
-	.mmap = iopmemc_mmap,
-};
-
 static DEFINE_IDA(iopmem_instance_ida);
 static DEFINE_SPINLOCK(ida_lock);
 
@@ -373,7 +296,6 @@ static int iopmem_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct iopmem_device *iopmem;
 	struct device *dev;
-	struct device *char_sys_dev;
 	int err = 0;
 	int nid = dev_to_node(&pdev->dev);
 
@@ -422,32 +344,11 @@ static int iopmem_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto out_free_queue;
 	}
 
-	cdev_init(&iopmem->cdev, &iopmemc_fops);
-	iopmem->cdev_num = MKDEV(MAJOR(char_device_num), iopmem->instance);
-	if ((err = cdev_add(&iopmem->cdev, iopmem->cdev_num, 1))) {
-		dev_err(dev, "failed to create char device!\n");
-		goto out_free_queue;
-	}
-
-        char_sys_dev = device_create(iopmemc_class, dev,
-				     iopmem->cdev_num,
-				     iopmem, "iopmemc%d",
-				     iopmem->instance);
-	if (IS_ERR(char_sys_dev)) {
-		err = -EFAULT;
-		dev_err(dev, "failed to create iopmemc device!\n");
-		goto out_free_chdev;
-	}
-
 	if ((err = iopmem_attach_disk(iopmem)))
-		goto out_free_chsysdev;
+		goto out_free_queue;
 
 	return 0;
 
-out_free_chsysdev:
-	device_destroy(iopmemc_class, iopmem->cdev_num);
-out_free_chdev:
-	cdev_del(&iopmem->cdev);
 out_free_queue:
 	blk_cleanup_queue(iopmem->queue);
 out_release_instance:
@@ -468,8 +369,6 @@ static void iopmem_remove(struct pci_dev *pdev)
 	blk_set_queue_dying(iopmem->queue);
 	iopmem_detach_disk(iopmem);
 	blk_cleanup_queue(iopmem->queue);
-	device_destroy(iopmemc_class, iopmem->cdev_num);
-	cdev_del(&iopmem->cdev);
 	iopmem_release_instance(iopmem);
 	put_device(iopmem->dev);
 	kfree(iopmem);
@@ -485,37 +384,19 @@ static struct pci_driver iopmem_pci_driver = {
 
 static int __init iopmem_init(void)
 {
-	int result;
+	int rc;
 
-	iopmemc_class = class_create(THIS_MODULE, "iopmemc");
-	if (IS_ERR(iopmemc_class))
-		return PTR_ERR(iopmemc_class);
-
-	if ((result = alloc_chrdev_region(&char_device_num, 0,
-					  max_devices, "iopmemc")))
-		goto out_destroy_class;
-
-	result = pci_register_driver(&iopmem_pci_driver);
-	if (result)
-		goto out_unreg_chrdev;
+	rc = pci_register_driver(&iopmem_pci_driver);
+	if (rc)
+		return rc;
 
 	pr_info("iopmem: module loaded\n");
 	return 0;
-
-out_unreg_chrdev:
-	unregister_chrdev_region(char_device_num, max_devices);
-
-out_destroy_class:
-	class_destroy(iopmemc_class);
-
-	return result;
 }
 
 static void __exit iopmem_exit(void)
 {
 	pci_unregister_driver(&iopmem_pci_driver);
-	class_destroy(iopmemc_class);
-	unregister_chrdev_region(char_device_num, max_devices);
 	pr_info("iopmem: module unloaded\n");
 }
 
