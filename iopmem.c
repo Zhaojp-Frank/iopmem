@@ -35,23 +35,17 @@
 #define PAGE_SECTORS_SHIFT	(PAGE_SHIFT - SECTOR_SHIFT)
 #define PAGE_SECTORS		(1 << PAGE_SECTORS_SHIFT)
 
-static int bar_id = 4;
-
 static struct class *iopmemc_class;
 static dev_t char_device_num;
 static int max_devices = 16;
 
-#define VENDOR_ID 0x11f8
-#define DEVICE_ID 0xf117
+static const int BAR_ID = 4;
 
 static struct pci_device_id iopmem_id_table[] = {
-	{ PCI_DEVICE(VENDOR_ID, DEVICE_ID) },
+	{ PCI_DEVICE(0x11f8, 0xf118) },
 	{ 0, }
 };
 MODULE_DEVICE_TABLE(pci, iopmem_id_table);
-
-module_param(bar_id, int, S_IRUGO);
-MODULE_PARM_DESC(bar_id, "The Base Address Register to use to the iopmem binding.");
 
 module_param(max_devices, int, S_IRUGO);
 MODULE_PARM_DESC(max_devices, "Maximum number of char devices");
@@ -394,8 +388,8 @@ static int iopmem_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto out_disable_device;
 	}
 
-	iopmem->phys_addr = pci_resource_start(pdev, bar_id);
-	iopmem->size = pci_resource_end(pdev, bar_id) - iopmem->phys_addr + 1;
+	iopmem->phys_addr = pci_resource_start(pdev, BAR_ID);
+	iopmem->size = pci_resource_end(pdev, BAR_ID) - iopmem->phys_addr + 1;
 	iopmem->dev = dev = get_device(&pdev->dev);
 	pci_set_drvdata(pdev, iopmem);
 
@@ -420,7 +414,7 @@ static int iopmem_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto out_release_instance;
 	}
 
-	iopmem->virt_addr = devm_memremap_pages(dev, &pdev->resource[bar_id],
+	iopmem->virt_addr = devm_memremap_pages(dev, &pdev->resource[BAR_ID],
 				&iopmem->queue->q_usage_counter,
 				NULL, MEMREMAP_WC);
 	if (IS_ERR(iopmem->virt_addr)) {
