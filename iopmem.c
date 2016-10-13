@@ -17,22 +17,11 @@
  * Copyright (C) 2007 Novell Inc.
  */
 
-#include <asm/cacheflush.h>
-#include <linux/bio.h>
 #include <linux/blkdev.h>
-#include <linux/fs.h>
-#include <linux/hdreg.h>
-#include <linux/init.h>
 #include <linux/module.h>
-#include <linux/moduleparam.h>
-#include <linux/slab.h>
 #include <linux/pci.h>
 #include <linux/pfn_t.h>
 #include <linux/memremap.h>
-
-#define SECTOR_SHIFT		9
-#define PAGE_SECTORS_SHIFT	(PAGE_SHIFT - SECTOR_SHIFT)
-#define PAGE_SECTORS		(1 << PAGE_SECTORS_SHIFT)
 
 static const int BAR_ID = 4;
 
@@ -55,38 +44,6 @@ struct iopmem_device {
 	size_t			size;
 };
 
-static int iopmem_getgeo(struct block_device *bd, struct hd_geometry *geo)
-{
-	/* some standard values */
-	geo->heads = 1 << 6;
-	geo->sectors = 1 << 5;
-	geo->cylinders = get_capacity(bd->bd_disk) >> 11;
-	return 0;
-}
-
-/*
- * direct translation from (iopmem,sector) => void*
- * We do not require that sector be page aligned.
- * The return value will point to the beginning of the page containing the
- * given sector, not to the sector itself.
- */
-static void *iopmem_lookup_pg_addr(struct iopmem_device *iopmem, sector_t sector)
-{
-	size_t page_offset = sector >> PAGE_SECTORS_SHIFT;
-	size_t offset = page_offset << PAGE_SHIFT;
-
-	BUG_ON(offset >= iopmem->size);
-	return iopmem->virt_addr + offset;
-}
-
-/* sector must be page aligned */
-static pfn_t iopmem_lookup_pfn(struct iopmem_device *iopmem, sector_t sector)
-{
-	size_t offset = sector << SECTOR_SHIFT;
-
-	return phys_to_pfn_t(iopmem->phys_addr + offset, PFN_DEV | PFN_MAP);
-}
-
 /* we can only access the iopmem device with full 32-bit word accesses which cannot
  * be gaurantee'd by the regular memcpy */
 static void memcpy_from_iopmem(void *dst, const void *src, size_t sz)
@@ -106,74 +63,38 @@ static void memcpy_from_iopmem(void *dst, const void *src, size_t sz)
 	memcpy(wdst, &tmp, sz);
 }
 
-/*
- * sector is not required to be page aligned.
- * n is at most a single page, but could be less.
- */
-static void copy_to_iopmem(struct iopmem_device *iopmem, const void *src,
-			sector_t sector, size_t n)
-{
-	u64 *dst;
-	unsigned int offset = (sector & (PAGE_SECTORS - 1)) << SECTOR_SHIFT;
-	size_t copy;
-
-	BUG_ON(n > PAGE_SIZE);
-
-	copy = min_t(size_t, n, PAGE_SIZE - offset);
-	dst = iopmem_lookup_pg_addr(iopmem, sector);
-	memcpy(dst + offset, src, copy);
-
-	if (copy < n) {
-		src += copy;
-		sector += copy >> SECTOR_SHIFT;
-		copy = n - copy;
-		dst = iopmem_lookup_pg_addr(iopmem, sector);
-		memcpy(dst, src, copy);
-	}
-}
-
-/*
- * sector is not required to be page aligned.
- * n is at most a single page, but could be less.
- */
-static void copy_from_iopmem(void *dst, struct iopmem_device *iopmem,
-			  sector_t sector, size_t n)
-{
-	void *src;
-	unsigned int offset = (sector & (PAGE_SECTORS - 1)) << SECTOR_SHIFT;
-	size_t copy;
-
-	BUG_ON(n > PAGE_SIZE);
-
-	copy = min_t(size_t, n, PAGE_SIZE - offset);
-	src = iopmem_lookup_pg_addr(iopmem, sector);
-
-	memcpy_from_iopmem(dst, src + offset, copy);
-
-	if (copy < n) {
-		dst += copy;
-		sector += copy >> SECTOR_SHIFT;
-		copy = n - copy;
-		src = iopmem_lookup_pg_addr(iopmem, sector);
-		memcpy_from_iopmem(dst, src, copy);
-	}
-}
-
-static void iopmem_do_bvec(struct iopmem_device *iopmem, struct page *page,
-			unsigned int len, unsigned int off, int rw,
-			sector_t sector)
+static void write_iopmem(void *iopmem_addr, struct page *page,
+		       unsigned int off, unsigned int len)
 {
 	void *mem = kmap_atomic(page);
 
-	if (rw == READ) {
-		copy_from_iopmem(mem + off, iopmem, sector, len);
+	memcpy(iopmem_addr, mem + off, len);
+	kunmap_atomic(mem);
+}
+
+static void read_iopmem(struct page *page, unsigned int off,
+			void *iopmem_addr, unsigned int len)
+{
+	void *mem = kmap_atomic(page);
+
+	memcpy_from_iopmem(mem + off, iopmem_addr, len);
+	kunmap_atomic(mem);
+}
+
+static void iopmem_do_bvec(struct iopmem_device *iopmem, struct page *page,
+			   unsigned int len, unsigned int off, bool is_write,
+			   sector_t sector)
+{
+	phys_addr_t iopmem_off = sector * 512;
+	void *iopmem_addr = iopmem->virt_addr + iopmem_off;
+
+	if (!is_write) {
+		read_iopmem(page, off, iopmem_addr, len);
 		flush_dcache_page(page);
 	} else {
 		flush_dcache_page(page);
-		copy_to_iopmem(iopmem, mem + off, sector, len);
+		write_iopmem(iopmem_addr, page, off, len);
 	}
-
-	kunmap_atomic(mem);
 }
 
 static blk_qc_t iopmem_make_request(struct request_queue *q, struct bio *bio)
@@ -206,21 +127,21 @@ static long iopmem_direct_access(struct block_device *bdev, sector_t sector,
 			       void **kaddr, pfn_t *pfn, long size)
 {
 	struct iopmem_device *iopmem = bdev->bd_queue->queuedata;
+	resource_size_t offset = sector * 512;
 
 	if (!iopmem)
 		return -ENODEV;
 
-	*kaddr = iopmem_lookup_pg_addr(iopmem, sector);
-	*pfn = iopmem_lookup_pfn(iopmem, sector);
+	*kaddr = iopmem->virt_addr + offset;
+	 *pfn = phys_to_pfn_t(iopmem->phys_addr + offset, PFN_DEV | PFN_MAP);
 
-	return iopmem->size - (sector * 512);
+	return iopmem->size - offset;
 }
 
 static const struct block_device_operations iopmem_fops = {
 	.owner =		THIS_MODULE,
 	.rw_page =		iopmem_rw_page,
 	.direct_access =	iopmem_direct_access,
-	.getgeo =		iopmem_getgeo,
 };
 
 static DEFINE_IDA(iopmem_instance_ida);
@@ -277,7 +198,7 @@ static int iopmem_attach_disk(struct iopmem_device *iopmem)
 	disk->queue		= q;
 	disk->flags		= GENHD_FL_EXT_DEVT;
 	sprintf(disk->disk_name, "iopmem%d", iopmem->instance);
-	set_capacity(disk, iopmem->size >> SECTOR_SHIFT);
+	set_capacity(disk, iopmem->size / 512);
 	iopmem->disk = disk;
 
 	device_add_disk(iopmem->dev, disk);
