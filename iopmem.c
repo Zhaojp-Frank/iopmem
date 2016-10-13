@@ -36,7 +36,6 @@
 #define PAGE_SECTORS		(1 << PAGE_SECTORS_SHIFT)
 
 static int bar_id = 4;
-static int iopmem_major;
 
 static struct class *iopmemc_class;
 static dev_t char_device_num;
@@ -196,54 +195,34 @@ static void iopmem_do_bvec(struct iopmem_device *iopmem, struct page *page,
 
 static blk_qc_t iopmem_make_request(struct request_queue *q, struct bio *bio)
 {
-	struct block_device *bdev = bio->bi_bdev;
-	struct iopmem_device *iopmem = bdev->bd_disk->private_data;
-	int rw;
+	struct iopmem_device *iopmem = q->queuedata;
 	struct bio_vec bvec;
-	sector_t sector;
 	struct bvec_iter iter;
-	int err = 0;
-
-	sector = bio->bi_iter.bi_sector;
-	if (bio_end_sector(bio) > get_capacity(bdev->bd_disk)) {
-		err = -EIO;
-		goto out;
-	}
-
-	BUG_ON(bio->bi_rw & REQ_DISCARD);
-
-	rw = bio_rw(bio);
-	if (rw == READA)
-		rw = READ;
 
 	bio_for_each_segment(bvec, bio, iter) {
-		unsigned int len = bvec.bv_len;
-
-		BUG_ON(len > PAGE_SIZE);
-		iopmem_do_bvec(iopmem, bvec.bv_page, len,
-			    bvec.bv_offset, rw, sector);
-		sector += len >> SECTOR_SHIFT;
+		iopmem_do_bvec(iopmem, bvec.bv_page, bvec.bv_len,
+			    bvec.bv_offset, op_is_write(bio_op(bio)),
+			    iter.bi_sector);
 	}
 
-out:
 	bio_endio(bio);
 	return BLK_QC_T_NONE;
 }
 
 static int iopmem_rw_page(struct block_device *bdev, sector_t sector,
-		       struct page *page, int rw)
+		       struct page *page, bool is_write)
 {
-	struct iopmem_device *iopmem = bdev->bd_disk->private_data;
+	struct iopmem_device *iopmem = bdev->bd_queue->queuedata;
 
-	iopmem_do_bvec(iopmem, page, PAGE_CACHE_SIZE, 0, rw, sector);
-	page_endio(page, rw & WRITE, 0);
+	iopmem_do_bvec(iopmem, page, PAGE_SIZE, 0, is_write, sector);
+	page_endio(page, is_write, 0);
 	return 0;
 }
 
 static long iopmem_direct_access(struct block_device *bdev, sector_t sector,
-			       void __pmem **kaddr, pfn_t *pfn)
+			       void **kaddr, pfn_t *pfn, long size)
 {
-	struct iopmem_device *iopmem = bdev->bd_disk->private_data;
+	struct iopmem_device *iopmem = bdev->bd_queue->queuedata;
 
 	if (!iopmem)
 		return -ENODEV;
@@ -362,29 +341,29 @@ static int iopmem_attach_disk(struct iopmem_device *iopmem)
 {
 	struct gendisk *disk;
 	int nid = dev_to_node(iopmem->dev);
+	struct request_queue *q = iopmem->queue;
 
-	blk_queue_make_request(iopmem->queue, iopmem_make_request);
-	blk_queue_physical_block_size(iopmem->queue, PAGE_SIZE);
-	blk_queue_max_hw_sectors(iopmem->queue, UINT_MAX);
-	blk_queue_bounce_limit(iopmem->queue, BLK_BOUNCE_ANY);
-	queue_flag_set_unlocked(QUEUE_FLAG_NONROT, iopmem->queue);
+	blk_queue_write_cache(q, true, true);
+	blk_queue_make_request(q, iopmem_make_request);
+	blk_queue_physical_block_size(q, PAGE_SIZE);
+	blk_queue_max_hw_sectors(q, UINT_MAX);
+	blk_queue_bounce_limit(q, BLK_BOUNCE_ANY);
+	queue_flag_set_unlocked(QUEUE_FLAG_NONROT, q);
+	queue_flag_set_unlocked(QUEUE_FLAG_DAX, q);
+	q->queuedata = iopmem;
 
 	disk = alloc_disk_node(0, nid);
 	if (unlikely(!disk))
 		return -ENOMEM;
 
-	disk->major		= iopmem_major;
-	disk->first_minor	= 0;
 	disk->fops		= &iopmem_fops;
-	disk->private_data	= iopmem;
-	disk->driverfs_dev      = iopmem->dev;
-	disk->queue		= iopmem->queue;
+	disk->queue		= q;
 	disk->flags		= GENHD_FL_EXT_DEVT;
 	sprintf(disk->disk_name, "iopmem%d", iopmem->instance);
 	set_capacity(disk, iopmem->size >> SECTOR_SHIFT);
 	iopmem->disk = disk;
 
-	add_disk(disk);
+	device_add_disk(iopmem->dev, disk);
 	revalidate_disk(disk);
 
 	return 0;
@@ -514,17 +493,9 @@ static int __init iopmem_init(void)
 {
 	int result;
 
-	result = register_blkdev(0, "iopmem");
-	if (result < 0)
-		return -EIO;
-	else
-		iopmem_major = result;
-
 	iopmemc_class = class_create(THIS_MODULE, "iopmemc");
-	if (IS_ERR(iopmemc_class)) {
-		result = PTR_ERR(iopmemc_class);
-		goto out_unreg_block;
-	}
+	if (IS_ERR(iopmemc_class))
+		return PTR_ERR(iopmemc_class);
 
 	if ((result = alloc_chrdev_region(&char_device_num, 0,
 					  max_devices, "iopmemc")))
@@ -543,9 +514,6 @@ out_unreg_chrdev:
 out_destroy_class:
 	class_destroy(iopmemc_class);
 
-out_unreg_block:
-	unregister_blkdev(iopmem_major, "iopmem");
-
 	return result;
 }
 
@@ -554,7 +522,6 @@ static void __exit iopmem_exit(void)
 	pci_unregister_driver(&iopmem_pci_driver);
 	class_destroy(iopmemc_class);
 	unregister_chrdev_region(char_device_num, max_devices);
-	unregister_blkdev(iopmem_major, "iopmem");
 	pr_info("iopmem: module unloaded\n");
 }
 
