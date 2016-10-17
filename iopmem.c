@@ -44,8 +44,11 @@ struct iopmem_device {
 	size_t			size;
 };
 
-/* we can only access the iopmem device with full 32-bit word accesses which cannot
- * be gaurantee'd by the regular memcpy */
+  /*
+   * We can only access the iopmem device with full 32-bit word
+   * accesses which cannot be gaurantee'd by the regular memcpy
+   */
+
 static void memcpy_from_iopmem(void *dst, const void *src, size_t sz)
 {
 	u64 *wdst = dst;
@@ -57,7 +60,8 @@ static void memcpy_from_iopmem(void *dst, const void *src, size_t sz)
 		sz -= sizeof(*wdst);
 	}
 
-	if (!sz) return;
+	if (!sz)
+		return;
 
 	tmp = *wsrc;
 	memcpy(wdst, &tmp, sz);
@@ -236,7 +240,8 @@ static int iopmem_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	iopmem->dev = dev = get_device(&pdev->dev);
 	pci_set_drvdata(pdev, iopmem);
 
-	if ((err = iopmem_set_instance(iopmem)))
+	err = iopmem_set_instance(iopmem);
+	if (err)
 		goto out_put_device;
 
 	dev_info(dev, "bar space 0x%llx len %lld\n",
@@ -265,7 +270,8 @@ static int iopmem_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto out_free_queue;
 	}
 
-	if ((err = iopmem_attach_disk(iopmem)))
+	err = iopmem_attach_disk(iopmem);
+	if (err)
 		goto out_free_queue;
 
 	return 0;
